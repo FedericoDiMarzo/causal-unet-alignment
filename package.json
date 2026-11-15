@@ -1,0 +1,11 @@
+{
+  "name": "causal-unet-alignment",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Interactive visualisation of CausalConv1d encoder / ConvTranspose1d decoder alignment and latency in a causal U-Net.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=16" },
+  "license": "UNLICENSED"
+}

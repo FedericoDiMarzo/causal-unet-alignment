@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transposed Conv Stack</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  /* Layout: control bar, one U-Net diagram (rows top to bottom: input, encoder, bottleneck, decoder, output), readout, misalignment table. */
+  --bg:#f2f4f8; --surface:#ffffff; --ink:#142033; --muted:#5a677b; --line:#d8dee8; --accent:#1d5fd1; --skip:#d2451e;
+  --c0:#2f6fdb; --c1:#e07b1a; --c2:#12907f; --c3:#c2358a; --c4:#9a8310;
+  --font-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0e1520; --surface:#162030; --ink:#e7ecf4; --muted:#93a1b6; --line:#2a3649; --accent:#6ea2ff; --skip:#ff7a52;
+    --c0:#6aa0ff; --c1:#ffa04d; --c2:#3fd0bb; --c3:#ff7ac0; --c4:#d9c24a;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0e1520; --surface:#162030; --ink:#e7ecf4; --muted:#93a1b6; --line:#2a3649; --accent:#6ea2ff; --skip:#ff7a52;
+  --c0:#6aa0ff; --c1:#ffa04d; --c2:#3fd0bb; --c3:#ff7ac0; --c4:#d9c24a;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--font-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1140px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:24px;margin:0 0 4px;font-weight:600}
+h2{font-size:15px;margin:0 0 8px;font-weight:600}
+.sub{margin:0 0 14px;color:var(--muted);max-width:76ch;font-size:14px}
+.sub .k{display:inline-block;width:18px;height:3px;vertical-align:middle;border-radius:2px;margin-right:4px}
+.bar{display:flex;flex-wrap:wrap;gap:10px 20px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:12px}
+.ctl{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.ctl input[type=range]{width:100px;accent-color:var(--accent)}
+.ctl input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}
+.ctl output{font-family:var(--font-mono);color:var(--ink);min-width:1.5ch}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:5px 10px;font-family:var(--font-mono);font-size:12.5px}
+.seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
+button{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:5px 12px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500;min-width:72px}
+:root[data-theme="dark"] button.primary,:root[data-theme="dark"] .seg button[aria-pressed="true"]{color:#0b1220}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) button.primary,:root:not([data-theme="light"]) .seg button[aria-pressed="true"]{color:#0b1220}}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.note{color:var(--accent);font-size:12.5px}
+.stage{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+canvas{display:block;cursor:crosshair}
+.readout{font-family:var(--font-mono);font-size:12.5px;color:var(--muted);margin:10px 2px 14px;min-height:3em}
+.readout b{color:var(--ink);font-weight:500}
+.readout .m{color:var(--accent)} .readout .s{color:var(--skip)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px}
+table{border-collapse:collapse;font-size:13px;width:100%}
+th,td{text-align:left;padding:5px 10px 5px 0;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500}
+td{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:0 8px;border-radius:999px;font-size:12px}
+.ok{background:color-mix(in srgb,var(--c2) 18%,transparent);color:var(--c2)}
+.bad{background:color-mix(in srgb,var(--skip) 18%,transparent);color:var(--skip)}
+.card p{margin:10px 0 0;color:var(--muted);font-size:13.5px;max-width:84ch}
+.tw{overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Causal U-Net: encoder vs decoder alignment</h1>
+  <p class="sub">The top half is the CausalConv1d encoder: each sample <b>gathers</b> K samples from the row above. The bottom half is the ConvTranspose1d decoder: each sample <b>projects</b> its kernel onto the row below. Skip connections join encoder and decoder rows of the same length. Hover a decoder sample to compare the input samples it sees through the
+  <span class="k" style="background:var(--accent)"></span>bottleneck path with the ones it sees through the <span class="k" style="background:var(--skip)"></span>skip path.</p>
+
+  <div class="bar">
+    <button id="play" class="primary" type="button">Play</button>
+    <button id="step" type="button">Step</button>
+    <span class="ctl">Encoder lookahead
+      <span class="seg" role="group" aria-label="Encoder lookahead"><button type="button" id="laF" aria-pressed="true">False</button><button type="button" id="laT" aria-pressed="false">True</button></span>
+    </span>
+    <label class="ctl" for="skips"><input type="checkbox" id="skips" checked> Skips</label>
+    <label class="ctl" for="depth">Depth <input id="depth" type="range" min="1" max="4" value="2"><output id="depthO"></output></label>
+    <label class="ctl" for="stride">Stride s <input id="stride" type="range" min="1" max="4" value="2"><output id="strideO"></output></label>
+    <label class="ctl" for="kern">Kernel K = k <input id="kern" type="range" min="2" max="4" value="3"><output id="kernO"></output></label>
+    <span id="note" class="note" role="status"></span>
+  </div>
+
+  <div class="stage" id="stage"><canvas id="cv" aria-label="U-Net dependency diagram"></canvas></div>
+  <p class="readout" id="readout" aria-live="polite"></p>
+  <section class="card" id="summary" aria-live="polite"></section>
+</div>
+
+<script>
+(function(){
+'use strict';
+var MAXS=16, D=2, s=2, K=3, LA=false, SKIPS=true;
+var tau=1e9, tauMin=0, tauMax=0, playing=false, last=0, hover=null, css={}, noteT=0;
+var cv=document.getElementById('cv'), stage=document.getElementById('stage');
+var PAL=['--c0','--c1','--c2','--c3','--c4'];
+var padL=112, padT=74, gap=68, W=0, H=0, cw=0, dpr=1;
+var G=null;
+var $=function(id){return document.getElementById(id);};
+var clamp=function(v,a,b){return Math.min(b,Math.max(a,v));};
+
+function readCss(){var c=getComputedStyle(document.documentElement);['--ink','--muted','--line','--accent','--surface','--skip'].concat(PAL).forEach(function(n){css[n]=c.getPropertyValue(n).trim();});}
+
+/* rows: 0 = input, 1..D encoder (D = bottleneck), D+1..2D decoder (2D = output).
+   Every row spans the same stretch of time; x is in input samples, t = index - PRE. */
+function hop(r){return Math.pow(s, r<=D ? r : 2*D-r);}           // input samples per row sample
+function rowLen(r){return G.N/hop(r);}
+function rowName(r){return r===0?'input':r<D?'enc '+r:r===D?'bottleneck':r===2*D?'output':'dec '+(r-D);}
+function skipLevel(r){var e=2*D-r; return (SKIPS&&r>D&&e>=1&&e<=D-1)?e:-1;}
+function tOf(i){return i-G.PRE;}
+
+function build(){
+  var S=Math.pow(s,D), R=2*D+1;
+  var Renc= s>1 ? 1+(K-1)*(S-1)/(s-1) : 1+(K-1)*D;
+  var preB=Math.ceil(Renc/S)+1, posB=Math.max(3,Math.ceil(16/S));
+  G={S:S,R:R,PRE:preB*S,N:(preB+posB)*S,preB:preB,NB:preB+posB};
+  var rows=[];
+  for(var r=0;r<R;r++){var n=rowLen(r),nodes=[];for(var j=0;j<n;j++)nodes.push({r:r,j:j,par:[],ch:[],skipPar:-1});rows.push(nodes);}
+  for(r=1;r<R;r++){
+    var cur=rows[r], up=rows[r-1], nu=up.length, i, m, t;
+    for(j=0;j<cur.length;j++){
+      var nd=cur[j];
+      if(r<=D){
+        for(i=0;i<K;i++){ m = LA ? j*s+i : (j+1)*s-K+i; if(m>=0&&m<nu){nd.par.push(m);up[m].ch.push(j);} }
+      } else {
+        for(t=Math.max(0,Math.ceil((j-K+1)/s));t<=Math.min(nu-1,Math.floor(j/s));t++){nd.par.push(t);up[t].ch.push(j);}
+        if(skipLevel(r)>0) nd.skipPar=j;
+      }
+    }
+  }
+  rows[0].forEach(function(nd){nd.lo=nd.hi=nd.mlo=nd.mhi=nd.j;});
+  for(r=1;r<R;r++) rows[r].forEach(function(nd){
+    var lo=1e9,hi=-1e9,mlo=1e9,mhi=-1e9;
+    nd.par.forEach(function(p){var q=rows[r-1][p];lo=Math.min(lo,q.lo);hi=Math.max(hi,q.hi);mlo=Math.min(mlo,q.mlo);mhi=Math.max(mhi,q.mhi);});
+    if(nd.skipPar>=0){var q=rows[skipLevel(r)][nd.skipPar];lo=Math.min(lo,q.lo);hi=Math.max(hi,q.hi);}
+    nd.lo=lo;nd.hi=hi;nd.mlo=mlo;nd.mhi=mhi;
+  });
+  // per-node ready time (input sample index after which it can be computed) = newest input it reads
+  rows.forEach(function(row){row.forEach(function(nd){nd.ready=nd.hi;});});
+  G.rows=rows;
+  // output lookahead in samples over t >= 0, excluding the last block (right edge padding)
+  var mn=1e9,mx=-1e9;
+  rows[2*D].forEach(function(nd){var b=Math.floor(nd.j/S); if(b<preB||b>G.NB-2) return; var a=nd.hi-nd.j; mn=Math.min(mn,a); mx=Math.max(mx,a);});
+  G.aheadMin=mn; G.aheadMax=mx;
+  tauMin=-1; tauMax=G.N+mx;
+}
+
+/* geometry */
+function X(r,j){return padL+(j+0.5)*hop(r)*cw;}
+function Y(r){return padT+r*gap;}
+function blockOf(r,j){return Math.floor(j*hop(r)/G.S);}
+function col(r,j){return css[PAL[((blockOf(r,j)-G.preB)%PAL.length+PAL.length)%PAL.length]];}
+function reveal(nd){return clamp((tau-nd.ready)*1.5+0.5-nd.r*0.05,0,1);}
+
+function layout(){
+  var avail=stage.clientWidth-padL-16;
+  cw=Math.max(10,avail/(G.N+G.S));
+  W=Math.ceil(padL+cw*(G.N+G.S)+16); H=padT+(G.R-1)*gap+34;
+  dpr=window.devicePixelRatio||1;
+  cv.width=W*dpr; cv.height=H*dpr; cv.style.width=W+'px'; cv.style.height=H+'px';
+}
+
+function trace(h){
+  var rows=G.rows, main={}, skip={}, down={}, key=function(r,j){return r+':'+j;};
+  var st=[[h.r,h.j,false]];
+  while(st.length){
+    var it=st.pop(), r=it[0], j=it[1], vs=it[2], k_=key(r,j), store=vs?skip:main;
+    if(store[k_]) continue; store[k_]=1;
+    var nd=rows[r][j];
+    if(r>0) nd.par.forEach(function(p){st.push([r-1,p,vs]);});
+    if(nd.skipPar>=0) st.push([skipLevel(r),nd.skipPar,true]);
+  }
+  st=[[h.r,h.j]];
+  while(st.length){
+    var it2=st.pop(), r2=it2[0], j2=it2[1], k2=key(r2,j2);
+    if(down[k2]) continue; down[k2]=1;
+    if(r2<G.R-1) rows[r2][j2].ch.forEach(function(c){st.push([r2+1,c]);});
+    if(SKIPS&&r2>=1&&r2<=D-1) st.push([2*D-r2,j2]);
+  }
+  return {main:main,skip:skip,down:down,key:key};
+}
+
+function draw(){
+  readCss();
+  var ctx=cv.getContext('2d'), rows=G.rows, S=G.S;
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  ctx.font='11px "IBM Plex Mono", ui-monospace, monospace'; ctx.textBaseline='middle';
+  var tr=hover?trace(hover):null;
+  var state=function(r,j){if(!tr)return 'all';var k_=tr.key(r,j);return tr.main[k_]?'main':tr.skip[k_]?'skip':tr.down[k_]?'down':'off';};
+  var top=padT-40, bot=Y(G.R-1)+16;
+
+  // past region, block stripes
+  ctx.fillStyle=css['--muted'];ctx.globalAlpha=0.08;ctx.fillRect(padL,top,G.PRE*cw,bot-top);ctx.globalAlpha=1;
+  for(var b=0;b<G.NB;b++){ if(b%2){ctx.fillStyle=css['--line'];ctx.globalAlpha=0.35;ctx.fillRect(padL+b*S*cw,top,S*cw,bot-top);ctx.globalAlpha=1;} }
+  ctx.strokeStyle=css['--ink'];ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(padL+G.PRE*cw+0.5,top);ctx.lineTo(padL+G.PRE*cw+0.5,bot);ctx.stroke();ctx.lineWidth=1;
+  ctx.fillStyle=css['--muted'];ctx.textAlign='left';ctx.fillText('past context (t < 0)',padL+4,top+8);
+  ctx.setLineDash([3,3]);ctx.strokeStyle=css['--muted'];ctx.strokeRect(padL+G.N*cw+0.5,top,S*cw-4,bot-top);ctx.setLineDash([]);
+
+  // t labels, one per input sample
+  var step=1;[1,2,4,8,16].some(function(v){step=v;return v*cw>=22;});
+  ctx.textAlign='center';
+  for(var i=0;i<G.N;i++){var t=tOf(i); if(((t%step)+step)%step) continue; ctx.fillStyle=t===0?css['--ink']:css['--muted']; ctx.fillText(String(t),X(0,i),12);}
+  ctx.textAlign='right';ctx.fillStyle=css['--muted'];ctx.fillText('t',padL-12,12);
+
+  // "now" cursor
+  if(tau<tauMax){var xn=padL+(tau+1)*cw;ctx.strokeStyle=css['--accent'];ctx.globalAlpha=0.6;ctx.beginPath();ctx.moveTo(xn+0.5,22);ctx.lineTo(xn+0.5,bot);ctx.stroke();ctx.globalAlpha=1;}
+
+  ctx.strokeStyle=css['--line'];ctx.beginPath();ctx.moveTo(padL-6,Y(D)+gap/2+0.5);ctx.lineTo(W-8,Y(D)+gap/2+0.5);ctx.stroke();
+  ctx.textAlign='right';
+  for(var r=0;r<G.R;r++){ctx.fillStyle=r===D?css['--ink']:css['--muted'];ctx.fillText(rowName(r),padL-12,Y(r));}
+  if(SKIPS) for(var e=1;e<=D-1;e++){
+    var xa=10+(D-1-e)*9;
+    ctx.strokeStyle=css['--skip'];ctx.globalAlpha=0.7;ctx.lineWidth=1.4;
+    ctx.beginPath();ctx.moveTo(padL-84,Y(e));ctx.lineTo(xa,Y(e));ctx.lineTo(xa,Y(2*D-e));ctx.lineTo(padL-84,Y(2*D-e));ctx.stroke();
+    ctx.globalAlpha=1;ctx.lineWidth=1;
+  }
+
+  // edges
+  for(r=1;r<G.R;r++){
+    var dense=rows[r].length>120;
+    rows[r].forEach(function(nd){
+      var a=reveal(nd); if(a<=0) return;
+      nd.par.forEach(function(p){
+        var sc=state(r,nd.j), sp=state(r-1,p), hi=false, hc=css['--accent'];
+        if(tr){ if(sc==='main'&&sp==='main')hi=true; else if((sc==='skip'||sc==='main')&&sp==='skip'){hi=true;hc=css['--skip'];} else if(sc==='down'&&(sp==='down'||(hover.r===r-1&&hover.j===p)))hi=true; }
+        ctx.strokeStyle=hi?hc:col(r-1,p);
+        ctx.globalAlpha=a*(tr?(hi?0.95:0.05):(dense?0.3:0.55));
+        ctx.lineWidth=hi?1.7:1;
+        ctx.beginPath();ctx.moveTo(X(r-1,p),Y(r-1));ctx.lineTo(X(r,nd.j),Y(r));ctx.stroke();
+      });
+    });
+    if(r>D&&K>s){
+      var up=rows[r-1], lst=up[up.length-1];
+      if(reveal(lst)>0) for(var ii=s;ii<K;ii++){var m=(up.length-1)*s+ii;ctx.strokeStyle=css['--muted'];ctx.globalAlpha=tr?0.05:0.4;ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(X(r-1,up.length-1),Y(r-1));ctx.lineTo(X(r,m),Y(r));ctx.stroke();ctx.setLineDash([]);}
+    }
+  }
+  ctx.globalAlpha=1;
+
+  if(tr&&SKIPS){
+    for(r=D+1;r<G.R;r++){
+      var e2=skipLevel(r); if(e2<0) continue;
+      rows[r].forEach(function(nd){
+        var sc=state(r,nd.j), sp=state(e2,nd.j);
+        var on=((sc==='main'||sc==='skip')&&sp==='skip')||(sc==='down'&&(sp==='down'||(hover.r===e2&&hover.j===nd.j)));
+        if(!on) return;
+        var x1=X(e2,nd.j), y1=Y(e2), x2=X(r,nd.j), y2=Y(r);
+        ctx.strokeStyle=css['--skip'];ctx.globalAlpha=0.85;ctx.lineWidth=1.5;ctx.setLineDash([5,3]);
+        ctx.beginPath();ctx.moveTo(x1,y1);ctx.bezierCurveTo(x1-26,y1+(y2-y1)*0.3,x2-26,y2-(y2-y1)*0.3,x2,y2);ctx.stroke();
+        ctx.setLineDash([]);ctx.lineWidth=1;
+      });
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // nodes
+  for(r=0;r<G.R;r++){
+    var rad=Math.max(1.8,Math.min(5.5,hop(r)*cw*0.3));
+    rows[r].forEach(function(nd){
+      var a=reveal(nd), st=state(r,nd.j), c=col(r,nd.j);
+      if(st==='main'||st==='down') c=(hover.r===r&&hover.j===nd.j)?c:css['--accent'];
+      if(st==='skip') c=css['--skip'];
+      ctx.globalAlpha=a>0?(st==='off'?0.18:1):0.15;
+      ctx.fillStyle=a>0?c:css['--surface'];ctx.strokeStyle=a>0?c:css['--muted'];
+      ctx.beginPath();ctx.arc(X(r,nd.j),Y(r),rad,0,6.2832);ctx.fill();ctx.stroke();
+    });
+  }
+  ctx.globalAlpha=1;
+  if(hover){var rh=Math.max(1.8,Math.min(5.5,hop(hover.r)*cw*0.3));ctx.strokeStyle=css['--ink'];ctx.lineWidth=2;ctx.beginPath();ctx.arc(X(hover.r,hover.j),Y(hover.r),rh+4,0,6.2832);ctx.stroke();ctx.lineWidth=1;}
+
+  // input windows above the input row
+  if(hover&&hover.r>0){
+    var nd=rows[hover.r][hover.j], p=hop(hover.r), p0=hover.j*p, p1=p0+p-1;
+    var bar=function(lo,hi,y,c,lab){ctx.fillStyle=c;ctx.globalAlpha=0.9;ctx.fillRect(padL+lo*cw+1,y-2,(hi-lo+1)*cw-2,4);ctx.globalAlpha=1;ctx.textAlign='right';ctx.fillText(lab,padL-12,y);};
+    ctx.strokeStyle=css['--ink'];ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(padL+p0*cw,Y(0)-8);ctx.lineTo(padL+p0*cw,Y(0)+8);ctx.moveTo(padL+(p1+1)*cw,Y(0)-8);ctx.lineTo(padL+(p1+1)*cw,Y(0)+8);ctx.stroke();ctx.lineWidth=1;
+    bar(nd.mlo,nd.mhi,Y(0)-18,css['--accent'],hover.r<=D?'reads':'bottleneck');
+    if(nd.skipPar>=0){var q=rows[skipLevel(hover.r)][nd.skipPar];bar(q.lo,q.hi,Y(0)-28,css['--skip'],'skip');}
+  }
+}
+
+function rng(a,b){a=tOf(a);b=tOf(b);return a===b?'t='+a:'t='+a+'…'+b;}
+function sgn(v){v=Math.round(v*10)/10;return (v>0?'+':'')+v;}
+function readout(){
+  var el=$('readout');
+  if(!hover){el.innerHTML='Each input dot is one time step t. Hover any sample: bars above the input row show which t it reads, black ticks show which t it stands for.<br>Output sample t can be computed once the input at its newest read t has arrived; that gap is its lookahead.';return;}
+  var nd=G.rows[hover.r][hover.j], p=hop(hover.r), p0=hover.j*p, p1=p0+p-1;
+  var txt='<b>'+rowName(hover.r)+' ['+hover.j+']</b> stands for '+rng(p0,p1);
+  if(hover.r===0){el.innerHTML=txt+'. Everything it feeds is highlighted.';return;}
+  txt+=' &middot; <span class="m">'+(hover.r<=D?'reads':'bottleneck path reads')+' '+rng(nd.mlo,nd.mhi)+'</span>';
+  if(nd.skipPar>=0){
+    var q=G.rows[skipLevel(hover.r)][nd.skipPar], d=(nd.mlo+nd.mhi)/2-(q.lo+q.hi)/2;
+    txt+=' &middot; <span class="s">skip path reads '+rng(q.lo,q.hi)+'</span><br>Window centres differ by <b>'+sgn(d)+'</b> samples'+(Math.abs(d)<0.01?' (aligned).':' (bottleneck window is '+(d<0?'earlier':'later')+').');
+  } else txt+='<br>Centre of what it reads vs where it stands: <b>'+sgn((nd.mlo+nd.mhi)/2-(p0+p1)/2)+'</b> samples.';
+  if(hover.r===2*D){var ah=nd.hi-hover.j; txt+=' Lookahead: <b>'+ah+'</b> sample'+(ah===1?'':'s')+' (needs input up to t='+tOf(nd.hi)+').';}
+  el.innerHTML=txt;
+}
+function summary(){
+  var rows=G.rows, S=G.S, b0=G.preB, b1=G.NB-2, any=false;
+  var html='<h2>Misalignment summary</h2><div class="tw"><table><thead><tr><th>Where</th><th>Offset (samples, t ≥ 0)</th><th>Status</th></tr></thead><tbody>';
+  for(var e=1;e<=D-1&&SKIPS;e++){
+    var r=2*D-e, mn=1e9, mx=-1e9, sum=0, cnt=0;
+    rows[r].forEach(function(nd){var b=blockOf(r,nd.j); if(b<b0||b>b1) return; var q=rows[e][nd.j], d=(nd.mlo+nd.mhi)/2-(q.lo+q.hi)/2; mn=Math.min(mn,d);mx=Math.max(mx,d);sum+=d;cnt++;});
+    any=true; var mean=cnt?sum/cnt:0, ok=Math.abs(mean)<0.01;
+    html+='<tr><td>skip enc '+e+' → dec '+(D-e)+'</td><td>centre offset mean '+sgn(mean)+(mn===mx?'':' (per sample '+sgn(mn)+' … '+sgn(mx)+')')+'</td><td><span class="pill '+(ok?'ok':'bad')+'">'+(ok?'aligned':'misaligned')+'</span></td></tr>';
+  }
+  var extra=G.aheadMax-(S-1);
+  html+='<tr><td>output lookahead</td><td>'+G.aheadMin+' … '+G.aheadMax+' (block buffering alone: 0 … '+(S-1)+')</td><td><span class="pill '+(extra>0?'bad':'ok')+'">'+(extra>0?'+'+extra+' samples extra':'no extra latency')+'</span></td></tr>';
+  html+='</tbody></table></div>';
+  var shift=(K-s)*(s>1?(S-1)/(s-1):D);
+  html+='<p>'+(!any?'Turn on skips and use depth ≥ 2 to compare skip and bottleneck windows. ':'')+
+    (LA?'Lookahead=True: each encoder frame reads [t&middot;s, t&middot;s+K&minus;1], the same footprint the tconv writes to, so skip and bottleneck windows line up. The encoder reaches K&minus;s samples into the next block at every level, so outputs need input further ahead.'
+       :'Lookahead=False: each encoder frame reads [(t+1)s&minus;K, (t+1)s&minus;1], K&minus;s samples earlier than the [t&middot;s, t&middot;s+K&minus;1] footprint the tconv writes to. Nothing reads past its own block, so the only wait is block buffering, but a skip adds encoder features that describe a different stretch of input from the decoder features. The shift adds up to (K&minus;s)(s<sup>D</sup>&minus;1)/(s&minus;1) = '+shift+' input samples at the bottleneck.')+'</p>';
+  $('summary').innerHTML=html;
+}
+
+function flash(msg){$('note').textContent=msg;clearTimeout(noteT);noteT=setTimeout(function(){$('note').textContent='';},2500);}
+function sync(){
+  $('depth').value=D;$('stride').value=s;$('kern').min=Math.max(1,s);$('kern').max=2*s;$('kern').value=K;
+  $('depthO').textContent=D;$('strideO').textContent=s;$('kernO').textContent=K;
+  $('laF').setAttribute('aria-pressed',String(!LA));$('laT').setAttribute('aria-pressed',String(LA));
+  build(); hover=null; tau=clamp(tau,tauMin,tauMax); layout(); readout(); summary(); draw();
+}
+function okParams(d,st){if(Math.pow(st,d)>MAXS){flash('Kept at s^depth ≤ '+MAXS+' so every t stays readable.');return false;}return true;}
+$('depth').addEventListener('input',function(){var v=+this.value;if(okParams(v,s))D=v;sync();});
+$('stride').addEventListener('input',function(){var v=+this.value;if(okParams(D,v)){s=v;K=clamp(K,s,2*s);}sync();});
+$('kern').addEventListener('input',function(){K=+this.value;sync();});
+$('laF').addEventListener('click',function(){LA=false;sync();});
+$('laT').addEventListener('click',function(){LA=true;sync();});
+$('skips').addEventListener('change',function(){SKIPS=this.checked;sync();});
+$('play').addEventListener('click',function(){if(!playing&&tau>=tauMax)tau=tauMin;playing=!playing;this.textContent=playing?'Pause':'Play';});
+$('step').addEventListener('click',function(){playing=false;$('play').textContent='Play';tau=tau>=tauMax?tauMin:Math.floor(tau)+1;draw();});
+
+cv.addEventListener('pointermove',function(e){
+  var rc=cv.getBoundingClientRect(), x=e.clientX-rc.left, y=e.clientY-rc.top;
+  var r=Math.round((y-padT)/gap), h=null;
+  if(r>=0&&r<G.R&&Math.abs(y-Y(r))<gap*0.4){var j=Math.floor((x-padL)/(hop(r)*cw));if(j>=0&&j<rowLen(r))h={r:r,j:j};}
+  if((h&&hover&&h.r===hover.r&&h.j===hover.j)||(!h&&!hover))return;
+  hover=h;readout();draw();
+});
+cv.addEventListener('pointerleave',function(){if(hover){hover=null;readout();draw();}});
+
+function tick(ts){
+  if(playing){tau+=Math.min(0.1,(ts-last)/1000)*Math.max(6,G.N/9);if(tau>=tauMax){tau=tauMax;playing=false;$('play').textContent='Play';}draw();}
+  last=ts;requestAnimationFrame(tick);
+}
+window.addEventListener('resize',function(){layout();draw();});
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+new MutationObserver(draw).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+if(document.fonts&&document.fonts.ready)document.fonts.ready.then(draw);
+sync(); requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
